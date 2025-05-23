@@ -17,5 +17,9 @@ lagmonitor.settings = {
     auto_profile = false,
     auto_profile_threshold = 80,
     auto_profile_interval = 1.0,
-    auto_profile_pattern = "auto_$datetime_lag$lag.txt"
+    auto_profile_pattern = "auto_$datetime_lag$lag_$lag_duration.txt",
+    -- Chat colors
+    chat_colors = {
+        admin_notice = "#FFA500",  -- Orange color for admin notifications
+    },
 }

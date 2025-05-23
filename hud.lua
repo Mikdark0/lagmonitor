@@ -19,12 +19,12 @@ function lagmonitor.update_hud(player)
         lagmonitor.metrics.lag_percent or 0,
         data.nearby_entities or 0,
         lagmonitor.profiler.active and " | PROFILING" or "")
-    
-    if not lagmonitor.hud_ids[name] then
+
+if not lagmonitor.hud_ids[name] then
         lagmonitor.hud_ids[name] = player:hud_add({
             type = "text",
             position = lagmonitor.settings.hud_position,
-            offset = {x = 0, y = -20},
+            offset = {x = 0, y = -120},  -- Changed from -20 to -60 to move 3cm up
             text = hud_text,
             alignment = {x = 0, y = 0},
             scale = {x = 100, y = 30},
@@ -33,6 +33,7 @@ function lagmonitor.update_hud(player)
     else
         player:hud_change(lagmonitor.hud_ids[name], "text", hud_text)
     end
+	
 end
 
 minetest.register_on_leaveplayer(function(player)

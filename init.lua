@@ -13,14 +13,25 @@ lagmonitor.jit = {
     insecure_env = minetest.request_insecure_environment()
 }
 
--- Set up profile directory
-lagmonitor.profiledir = minetest.get_worldpath() .. "/profiles"
+-- Set up profile directory with date-time folder
+local now = os.date("*t")
+local profile_subdir = string.format("autoprofile_%04d-%02d-%02d_%02d-%02d-%02d", 
+    now.year, now.month, now.day, now.hour, now.min, now.sec)
+lagmonitor.profiledir = minetest.get_worldpath() .. "/profiles/" .. profile_subdir
 minetest.mkdir(lagmonitor.profiledir)
 
 -- Load dependencies
 local path = minetest.get_modpath("lagmonitor")
 dofile(path .. "/settings.lua")
 dofile(path .. "/hud.lua")
+
+-- Helper function for colored chat messages
+function lagmonitor.colored_chat_message(name, message, color)
+    if not name or not minetest.check_player_privs(name, {server=true}) then
+        return
+    end
+    minetest.chat_send_player(name, minetest.colorize(color, message))
+end
 
 -- Initialize JIT profiling if available
 if lagmonitor.jit.available and lagmonitor.jit.insecure_env then
@@ -84,18 +95,11 @@ minetest.register_globalstep(function(dtime)
         -- Start profiling if lag exceeds threshold
         if lag >= threshold and not lagmonitor.profiler.active then
             local now = os.date("*t")
-            local vars = {
-                date = os.date("%Y-%m-%d"),
-                time = os.date("%H-%M-%S"),
-                datetime = os.date("%Y-%m-%d_%H-%M-%S"),
-                lag = string.format("%.0f", lag),
-                interval = string.format("%.1f", lagmonitor.settings.auto_profile_interval),
-                world = minetest.get_worldpath():match("([^/]+)$") or "world"
-            }
-            
-            local filename = (lagmonitor.settings.auto_profile_pattern or "auto_$datetime_lag$lag.txt")
-                :gsub("%$(%w+)", vars)
-                :gsub("[^%w._-]", "_")
+            local current_lag = string.format("%.0f", lag)
+            local filename = string.format("auto_%04d-%02d-%02d_%02d-%02d-%02d_lag%s_STARTED.txt",
+                now.year, now.month, now.day,
+                now.hour, now.min, now.sec,
+                current_lag)
             
             local ok, msg = lagmonitor.start_profiling(
                 lagmonitor.settings.auto_profile_interval,
@@ -103,7 +107,7 @@ minetest.register_globalstep(function(dtime)
             )
             
             if ok then
-                minetest.log("action", "[LagMonitor] Auto-profiling started: " .. msg)
+                minetest.log("action", "[LagMonitor] Auto-profiling started. File: " .. filename)
             end
         end
         
@@ -128,8 +132,6 @@ function lagmonitor.start_profiling(interval, filename)
                    lagmonitor.settings.min_profile_interval)
     end
     
-    filename = filename or os.date("profile_%Y-%m-%d_%H-%M-%S.txt")
-    
     -- Check if profiling is available
     if not lagmonitor.jit.profile then
         return false, "JIT profiling not available (check secure.trusted_mods)"
@@ -153,12 +155,19 @@ function lagmonitor.start_profiling(interval, filename)
     
     local function record(thread, samples, vmstate)
         if samples > 0 then
-            got_data = true
-            samples_recorded = samples_recorded + samples
-            file:write(
-                lagmonitor.jit.profile.dumpstack(thread, "pF;", -100), 
-                vmstate, " ", samples, "\n"
-            )
+            local ok, err = pcall(function()
+                file:write(
+                    lagmonitor.jit.profile.dumpstack(thread, "pF;", -100), 
+                    vmstate, " ", samples, "\n"
+                )
+                file:flush()
+            end)
+            if ok then
+                got_data = true
+                samples_recorded = samples_recorded + samples
+            else
+                minetest.log("error", "[LagMonitor] Error writing profile data: " .. tostring(err))
+            end
         end
     end
     
@@ -176,8 +185,18 @@ function lagmonitor.start_profiling(interval, filename)
         samples_recorded = samples_recorded
     }
     
-    return true, string.format("Started profiling (%.2fs intervals)\nOutput: %s", 
-           interval, filepath)
+    -- Send colored notification to admins
+    local notice = string.format("[LagMonitor] Profiling started. File: %s/%s", 
+        profile_subdir, filename)
+    for _, player in ipairs(minetest.get_connected_players()) do
+        local pname = player:get_player_name()
+        if minetest.check_player_privs(pname, {server=true}) then
+            lagmonitor.colored_chat_message(pname, notice, lagmonitor.settings.chat_colors.admin_notice)
+        end
+    end
+    
+    return true, string.format("Started profiling (%.2fs intervals)\nLocation: %s/%s", 
+           interval, profile_subdir, filename)
 end
 
 function lagmonitor.stop_profiling()
@@ -185,36 +204,80 @@ function lagmonitor.stop_profiling()
         return false, "No active profiling session"
     end
     
+    -- Calculate duration
+    local duration_sec = (minetest.get_us_time() - lagmonitor.profiler.start_time) / 1000000
+    local duration_str = string.format("%.1f", duration_sec)
+    
     -- Stop profiling
     lagmonitor.jit.profile.stop()
     
-    local duration = (minetest.get_us_time() - lagmonitor.profiler.start_time) / 1000000
     local filepath = lagmonitor.profiledir .. "/" .. lagmonitor.profiler.filename
     
-    -- Only keep file if we got data
-    if lagmonitor.profiler.got_data and lagmonitor.profiler.samples_recorded > 0 then
+    -- Flush and check file contents
+    lagmonitor.profiler.file:flush()
+    local current_pos = lagmonitor.profiler.file:seek("cur")
+    local file_size = lagmonitor.profiler.file:seek("end")
+    lagmonitor.profiler.file:seek("set", current_pos)
+
+    if file_size > 0 then
+        -- Create final filename with single 's' suffix
+        local base_name = lagmonitor.profiler.filename:gsub("_STARTED.txt$", "")
+        local new_filename = base_name .. "_" .. duration_str .. "s.txt"
+        local new_filepath = lagmonitor.profiledir .. "/" .. new_filename
+        
+        -- Close and rename
         lagmonitor.profiler.file:close()
-        local msg = string.format("Stopped profiling after %.1fs\nSamples: %d\nFile: %s", 
-               duration, lagmonitor.profiler.samples_recorded, filepath)
+        os.rename(filepath, new_filepath)
+        
+        -- Write autoprofile folder path to server_tools.txt
+        local worldpath = minetest.get_worldpath()
+        local command_file = worldpath .. "/server_tools.txt"
+        local relative_path = lagmonitor.profiledir:gsub("^"..worldpath.."/", "")
+        
+        local file, err = io.open(command_file, "w")
+        if file then
+            file:write("# autoprofile " .. relative_path)
+            file:close()
+            minetest.log("action", "[LagMonitor] Saved autoprofile path to server_tools.txt: " .. relative_path)
+        else
+            minetest.log("error", "[LagMonitor] Failed to write server_tools.txt: " .. tostring(err))
+        end
+        
+        -- Notify admins
+        local notice = string.format("[LagMonitor] Profile saved: %s/%s", 
+            profile_subdir, new_filename)
+        for _, player in ipairs(minetest.get_connected_players()) do
+            local pname = player:get_player_name()
+            if minetest.check_player_privs(pname, {server=true}) then
+                lagmonitor.colored_chat_message(pname, notice, lagmonitor.settings.chat_colors.admin_notice)
+            end
+        end
+        
+        local msg = string.format("Profiling complete\nDuration: %ss\nLocation: %s/%s\n" ..
+               "Path saved to server_tools.txt",
+               duration_str, profile_subdir, new_filename)
         
         -- Reset state
-        lagmonitor.profiler = {
-            active = false,
-            file = nil,
-            start_time = nil
-        }
+        lagmonitor.profiler = {active = false, file = nil, start_time = nil}
         return true, msg
     else
+        -- Close and delete empty file
         lagmonitor.profiler.file:close()
         os.remove(filepath)
-        local msg = string.format("Discarded empty profile after %.1fs (no samples recorded)", duration)
+        
+        -- Send colored notification to admins
+        local notice = string.format("[LagMonitor] Discarded empty profile after %ss", duration_str)
+        for _, player in ipairs(minetest.get_connected_players()) do
+            local pname = player:get_player_name()
+            if minetest.check_player_privs(pname, {server=true}) then
+                lagmonitor.colored_chat_message(pname, notice, lagmonitor.settings.chat_colors.admin_notice)
+            end
+        end
+        
+        local msg = string.format("Discarded empty profile after %ss (no samples recorded)", duration_str)
         
         -- Reset state
-        lagmonitor.profiler = {
-            active = false,
-            file = nil,
-            start_time = nil
-        }
+        lagmonitor.profiler = {active = false, file = nil, start_time = nil}
         return false, msg
     end
 end
@@ -222,12 +285,11 @@ end
 -- Chat commands
 minetest.register_chatcommand("lagprofile", {
     description = "Control performance profiling\n" ..
-        "Variables: $date, $time, $datetime, $lag, $interval, $world\n" ..
         "Usage:\n" ..
-        "Start: /lagprofile start [interval] [filename_pattern]\n" ..
+        "Start: /lagprofile start [interval]\n" ..
         "Stop: /lagprofile stop\n" ..
         "Status: /lagprofile status",
-    params = "<start|stop|status> [interval] [filename_pattern]",
+    params = "<start|stop|status> [interval]",
     privs = {server = true},
     func = function(name, param)
         local parts = param:split(" ")
@@ -235,24 +297,12 @@ minetest.register_chatcommand("lagprofile", {
         
         if action == "start" then
             local interval = tonumber(parts[2])
-            local pattern = parts[3] and table.concat({select(3, unpack(parts))}, " ") or "profile_$datetime.txt"
-            
-            -- Replace variables in filename
             local now = os.date("*t")
-            local vars = {
-                date = os.date("%Y-%m-%d"),
-                time = os.date("%H-%M-%S"),
-                datetime = os.date("%Y-%m-%d_%H-%M-%S"),
-                lag = lagmonitor.metrics.lag_percent and 
-                      string.format("%.0f", lagmonitor.metrics.lag_percent) or "0",
-                interval = interval and string.format("%.1f", interval) or lagmonitor.settings.default_profile_interval,
-                world = minetest.get_worldpath():match("([^/]+)$") or "world"
-            }
-            
-            local filename = pattern:gsub("%$(%w+)", vars):gsub("[^%w._-]", "_")
-            if not filename:match("%.txt$") then
-                filename = filename .. ".txt"
-            end
+            local current_lag = string.format("%.0f", lagmonitor.metrics.lag_percent or 0)
+            local filename = string.format("auto_%04d-%02d-%02d_%02d-%02d-%02d_lag%s_STARTED.txt",
+                now.year, now.month, now.day,
+                now.hour, now.min, now.sec,
+                current_lag)
             
             return lagmonitor.start_profiling(interval, filename)
             
@@ -273,7 +323,7 @@ minetest.register_chatcommand("lagprofile", {
                 "Current lag: %.1f%%\n" ..
                 "JIT available: %s",
                 status,
-                lagmonitor.profiledir,
+                lagmonitor.profiledir:gsub("^"..minetest.get_worldpath().."/", ""),
                 lagmonitor.metrics.lag_percent or 0,
                 lagmonitor.jit.profile and "YES" or "NO"
             )
@@ -284,58 +334,78 @@ minetest.register_chatcommand("lagprofile", {
 })
 
 minetest.register_chatcommand("autoprofile", {
-    description = "Configure automatic profiling\n" ..
+    description = "Control automatic profiling\n" ..
         "Usage:\n" ..
-        "/autoprofile on <threshold> <interval> <filename_pattern>\n" ..
-        "/autoprofile off\n" ..
-        "/autoprofile status",
-    params = "<on|off|status> [threshold] [interval] [filename_pattern]",
+        "Start: /autoprofile start <threshold> <interval>\n" ..
+        "Stop: /autoprofile stop\n" ..
+        "Status: /autoprofile status",
+    params = "<start|stop|status> [threshold] [interval]",
     privs = {server = true},
     func = function(name, param)
         local parts = param:split(" ")
         local action = parts[1] or "status"
         
-        if action == "on" then
+        if action == "start" then
             local threshold = tonumber(parts[2]) or lagmonitor.settings.auto_profile_threshold
             local interval = tonumber(parts[3]) or lagmonitor.settings.auto_profile_interval
-            local pattern = parts[4] and table.concat({select(4, unpack(parts))}, " ") or 
-                          lagmonitor.settings.auto_profile_pattern or "auto_$datetime_lag$lag.txt"
             
             lagmonitor.settings.auto_profile = true
             lagmonitor.settings.auto_profile_threshold = threshold
             lagmonitor.settings.auto_profile_interval = interval
-            lagmonitor.settings.auto_profile_pattern = pattern
+            
+            lagmonitor.colored_chat_message(name, "Auto-profiling STARTED", 
+                lagmonitor.settings.chat_colors.admin_notice)
             
             return true, string.format(
-                "Auto-profiling ENABLED\n" ..
+                "Auto-profiling STARTED\n" ..
                 "Threshold: %.0f%% lag\n" ..
-                "Interval: %.1fs\n" ..
-                "Filename: %s",
+                "Interval: %.1fs",
                 threshold,
-                interval, 
-                pattern
+                interval
             )
             
-        elseif action == "off" then
+        elseif action == "stop" then
             lagmonitor.settings.auto_profile = false
-            return true, "Auto-profiling DISABLED"
+            
+            -- Write autoprofile folder path to server_tools.txt
+            local worldpath = minetest.get_worldpath()
+            local command_file = worldpath .. "/server_tools.txt"
+            local relative_path = lagmonitor.profiledir:gsub("^"..worldpath.."/", "")
+            
+            local file, err = io.open(command_file, "w")
+            if file then
+                file:write("# autoprofile " .. relative_path)
+                file:close()
+                minetest.log("action", "[LagMonitor] Saved autoprofile path to server_tools.txt: " .. relative_path)
+            else
+                minetest.log("error", "[LagMonitor] Failed to write server_tools.txt: " .. tostring(err))
+            end
+            
+            lagmonitor.colored_chat_message(name, "Auto-profiling STOPPED", 
+                lagmonitor.settings.chat_colors.admin_notice)
+            return true, string.format(
+                "Auto-profiling STOPPED\n" ..
+                "Profile folder: %s\n" ..
+                "Path saved to server_tools.txt",
+                relative_path
+            )
             
         elseif action == "status" then
             return true, string.format(
                 "Auto-profiling: %s\n" ..
                 "Threshold: %.0f%% lag\n" ..
                 "Interval: %.1fs\n" ..
-                "Filename pattern: %s\n" ..
-                "Current lag: %.1f%%",
-                lagmonitor.settings.auto_profile and "ENABLED" or "DISABLED",
+                "Current lag: %.1f%%\n" ..
+                "Profile folder: %s",
+                lagmonitor.settings.auto_profile and "ACTIVE" or "INACTIVE",
                 lagmonitor.settings.auto_profile_threshold,
                 lagmonitor.settings.auto_profile_interval,
-                lagmonitor.settings.auto_profile_pattern,
-                lagmonitor.metrics.lag_percent or 0
+                lagmonitor.metrics.lag_percent or 0,
+                lagmonitor.profiledir:gsub("^"..minetest.get_worldpath().."/", "")
             )
         end
         
-        return false, "Invalid action. Use: on, off, or status"
+        return false, "Invalid action. Use: start, stop, or status"
     end
 })
 
